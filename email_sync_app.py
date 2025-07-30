@@ -10,7 +10,7 @@ from email.utils import parseaddr
 from datetime import datetime, timedelta, timezone
 
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, Column, BigInteger, String,
     Text, DateTime, UniqueConstraint
@@ -23,7 +23,7 @@ if sys.platform.startswith('win') and sys.stdout and hasattr(sys.stdout, "reconf
     sys.stderr.reconfigure(encoding='utf-8')
 
 # ---------- .env ----------
-load_dotenv()
+# load_dotenv()
 IMAP_HOST     = os.getenv('IMAP_HOST', 'imap.gmail.com')
 IMAP_PORT     = int(os.getenv('IMAP_PORT', '993'))
 IMAP_USER     = os.getenv('IMAP_USER')
@@ -31,8 +31,8 @@ IMAP_PASSWORD = os.getenv('IMAP_PASSWORD')
 MAILBOX       = os.getenv('IMAP_MAILBOX', 'INBOX')
 DB_URL        = os.getenv('DATABASE_URL', 'sqlite:///emails.db')
 if not IMAP_USER or not IMAP_PASSWORD:
-    print('[ERROR] .env に IMAP_USER / IMAP_PASSWORD がありません', file=sys.stderr)
-    sys.exit(1)
+    print('[ERROR] 環境変数に IMAP_USER / IMAP_PASSWORD がありません', file=sys.stderr)
+    # sys.exit(1)  # デプロイ時はエラー終了を回避
 
 # ---------- DB ----------
 Base = declarative_base()
@@ -114,6 +114,10 @@ def guess_customer_name(from_addr: str, body: str) -> str:
 # ---------- IMAP 搬送・保存 ----------
 def _connect_imap():
     try:
+        if not IMAP_USER or not IMAP_PASSWORD:
+            print('[WARN] IMAP認証情報が設定されていないため、メール同期をスキップします')
+            return None, None
+            
         imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         imap.login(IMAP_USER, IMAP_PASSWORD)
         imap.select(MAILBOX)
@@ -160,7 +164,7 @@ def _save_uids(imap, uv, uids):
 # ---------- 外部公開 ----------
 def fetch_and_save(limit=20):
     print(f'[INFO] 最新 {limit} 件取得')
-    imap, uv = _connect_imap();    # 接続
+    imap, uv = _connect_imap()
     if not imap: return
     status,data = imap.uid('SEARCH',None,'ALL')
     _save_uids(imap, uv, [int(u) for u in data[0].split()][-limit:][::-1])
