@@ -5,7 +5,7 @@ Flask UI + API  – 手動登録＋写真＋ステータス更新（Detached 回
 import os, logging, time
 from datetime import datetime as dt, timezone
 from pathlib import Path
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 from flask import (
     Flask, render_template, request, url_for, send_from_directory,
     jsonify, abort, Response
@@ -51,7 +51,7 @@ if 'archived' not in [c['name'] for c in inspect(engine_tmp).get_columns('emails
         c.exec_driver_sql("ALTER TABLE emails ADD COLUMN archived INTEGER DEFAULT 0;")
 
 # ── Flask / DB ─────────────────────────────────────────
-load_dotenv()
+# load_dotenv()  # コメントアウト
 DB_URL  = os.getenv('DATABASE_URL', 'sqlite:///emails.db')
 SECRET  = os.getenv('FLASK_SECRET_KEY', 'dev')
 UPLOAD  = Path(__file__).with_name('uploads'); UPLOAD.mkdir(exist_ok=True)
@@ -202,5 +202,5 @@ def proxy():
 
 if __name__=='__main__':
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-    port = int(os.environ.get('PORT', 5000))  # ←この行を追加
-    app.run(host='0.0.0.0', port=port, debug=False)  # ←debug=Falseに変更
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

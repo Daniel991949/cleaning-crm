@@ -1,0 +1,5 @@
+undefinedFlask==2.3.3
+SQLAlchemy==2.0.23
+APScheduler==3.10.4
+requests==2.31.0
+Werkzeug==2.3.7
