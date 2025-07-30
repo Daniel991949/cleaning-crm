@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>クリーニング見積もり管理</title>
+<style>
+/*── レイアウト ─────────────────────────────*/
+body{display:flex;height:100vh;margin:0;font-family:Arial,Helvetica,sans-serif}
+#sidebar{width:380px;min-width:320px;border-right:1px solid #ccc;overflow:auto}
+#detail{flex:1;overflow:auto;padding:16px}
+
+/*── 一覧テーブル ───────────────────────────*/
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #ddd;padding:6px;font-size:.9rem}
+th{background:#f0f0f0;position:sticky;top:0}
+tr:hover{outline:2px solid #4285f4;cursor:pointer}
+tr.selected{outline:2px solid #4285f4}
+.st-new{background:#ffecec}.st-sent{background:#e5ffe5}
+.st-req{background:#e6f2ff}.st-in{background:#fff7cc}.st-out{background:#fff}
+.arch{background:#f5f5f5!important;color:#999}
+.ellipsis{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+
+/*── 詳細ビュー ───────────────────────────*/
+.inline-wrap{display:inline-block;width:23%;min-width:140px;margin:4px;vertical-align:top;position:relative}
+.inline-thumb{width:100%;height:auto;border:1px solid #ccc}
+.dl-link{display:none;position:absolute;right:4px;bottom:4px;background:rgba(0,0,0,.6);color:#fff;font-size:12px;padding:2px 4px;border-radius:3px;text-decoration:none}
+.inline-wrap:hover .dl-link{display:block}
+.photos{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.photos a{flex:0 0 calc(25% - 8px);min-width:150px}
+.photos img{width:100%;height:auto;border:1px solid #ccc}
+textarea{width:100%;min-height:110px;font-family:monospace;font-size:.9rem;padding:6px}
+.note-block{margin-bottom:10px;border:1px solid #ddd;padding:4px;border-radius:4px}
+.note-block h4{margin:2px 0 6px;font-size:.9rem}
+
+/*── 画像モーダル ───────────────────────────*/
+#img-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);justify-content:center;align-items:center;z-index:999}
+#img-modal img{max-width:90%;max-height:90%}
+#img-dl{position:absolute;top:18px;right:30px;font-size:1.3rem;color:#fff;text-decoration:none}
+
+/*── 手動登録ダイアログ ───────────────────────*/
+#addDlg{display:none;position:fixed;inset:0;justify-content:center;align-items:center;background:rgba(0,0,0,.5);z-index:1000}
+#addDlg form{background:#fff;padding:18px 20px;border-radius:8px;width:340px;box-shadow:0 4px 12px rgba(0,0,0,.25)}
+#addDlg input[type=text]{width:100%;padding:6px;margin-bottom:8px}
+#addDlg textarea{height:120px;width:100%;padding:6px}
+</style>
+</head>
+<body>
+
+<!--──────── 左ペイン ─────────────────────────-->
+<div id="sidebar">
+  <div style="padding:8px;border-bottom:1px solid #ccc;background:#fafafa;display:flex;gap:6px;align-items:center">
+    <button id="syncBtn">今すぐ取り込む</button>
+    <button id="addBtn">＋手動登録</button>
+    <button id="archToggle" title="アーカイブ表示切替">🌓</button>
+    <input id="nameFilter" placeholder="顧客名検索" style="flex:1;min-width:0;font-size:.85rem;padding:4px">
+    <span id="syncMsg" style="font-size:.8rem;color:#555"></span>
+  </div>
+
+  <table>
+    <thead><tr><th>UID</th><th>件名</th><th>顧客名</th></tr></thead>
+    <tbody id="list">
+      {% for m in emails %}
+      <tr data-uv="{{m.uidvalidity}}" data-uid="{{m.uid}}" data-arch="{{1 if m.archived else 0}}"
+          class="{{'arch ' if m.archived else ''}}st-{{
+            'new' if m.status=='未対応' else
+            'sent' if m.status=='見積メール送信済' else
+            'req' if m.status=='依頼あり' else
+            'in' if m.status=='荷物受け取り' else 'out'}}">
+        <td>{{m.uid}}</td>
+        <td class="ellipsis" title="{{m.subject}}">{{m.subject}}</td>
+        <td class="ellipsis cust" title="{{m.customer_name}}">{{m.customer_name}}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!--──────── 右ペイン ─────────────────────────-->
+<div id="detail"><p>左のメールをクリックしてください。</p></div>
+
+<!-- 画像モーダル -->
+<div id="img-modal"><a id="img-dl" download>↓保存</a><img id="img-view"></div>
+
+<!-- 手動登録ダイアログ -->
+<div id="addDlg">
+  <form id="addForm" enctype="multipart/form-data">
+    <h3>手動登録</h3>
+    <input type="text" name="name" placeholder="顧客名 (必須)" required>
+    <textarea name="memo" placeholder="フリーテキスト (空でも可)"></textarea>
+    <input type="file" name="photos" accept="image/*" multiple style="margin:6px 0">
+    <div style="text-align:right;margin-top:6px">
+      <button type="button" id="addCancel">キャンセル</button>
+      <button type="submit">登録</button>
+    </div>
+  </form>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+
+/* 要素参照 */
+const list=document.getElementById('list'), detail=document.getElementById('detail');
+const modal=document.getElementById('img-modal'), filter=document.getElementById('nameFilter');
+const archToggle=document.getElementById('archToggle'); let showArch=false, curRow=null;
+
+/* ES 便利関数 */
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+
+/* 一覧フィルタ */
+function applyFilter(){
+  const q=filter.value.trim(), reg=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'i');
+  list.querySelectorAll('tr').forEach(tr=>{
+    const name=tr.querySelector('.cust').textContent, isArch=tr.dataset.arch==='1';
+    const show=q===''? (showArch||!isArch) : reg.test(name);
+    tr.style.display=show?'':'none';
+  });
+  if(curRow&&curRow.style.display==='none'){ detail.innerHTML='<p>左のメールをクリックしてください。</p>'; curRow=null; }
+}
+filter.oninput=applyFilter;
+archToggle.onclick=()=>{ showArch=!showArch; archToggle.textContent=showArch?'🌕':'🌓'; applyFilter(); };
+
+/* 手動登録ダイアログ */
+const dlg=document.getElementById('addDlg'), form=dlg.querySelector('#addForm');
+document.getElementById('addBtn').onclick=()=>{ form.reset(); dlg.style.display='flex'; };
+document.getElementById('addCancel').onclick=()=>{ dlg.style.display='none'; };
+form.onsubmit=async e=>{
+  e.preventDefault();
+  const fd=new FormData(form);
+  const r=await fetch('/manual_add',{method:'POST',body:fd});
+  if(r.ok){ alert('登録しました。再読み込みします'); location.reload(); }
+  else{ alert('失敗: '+(await r.text())); }
+};
+
+/* 同期 */
+const syncBtn=document.getElementById('syncBtn'), syncMsg=document.getElementById('syncMsg');
+syncBtn.onclick=async ()=>{
+  syncBtn.disabled=true; syncMsg.textContent='同期中…';
+  try{const j=await (await fetch('/sync_now',{method:'POST'})).json();
+      syncMsg.textContent=j.ok?'完了。リロードしてください':`失敗:${j.error}`;}
+  catch{syncMsg.textContent='通信エラー';}
+  syncBtn.disabled=false;
+};
+
+/* 本文整形（画像サムネ） */
+function fmtBody(txt){
+  const seen=new Set();
+  let s=esc(txt);
+  s=s.replace(/(?:&lt;|\[)?\s*(https?:\/\/[^\s"'<>]+\.(?:png|jpe?g|gif))\s*(?:\]|&gt;)?/gi,
+    (_,u)=>{if(seen.has(u))return'';seen.add(u);const enc=encodeURIComponent(u);
+      return `<span class="inline-wrap"><img class="inline-thumb" src="/proxy?url=${enc}">
+              <a class="dl-link" href="/proxy?url=${enc}" download>DL</a></span>`});
+  s=s.replace(/(https?:\/\/[^\s"'<>]+)/gi,'<a target="_blank" href="$1">$1</a>');
+  return s.replace(/\n/g,'<br>');
+}
+
+/* 詳細表示 */
+list.onclick=e=>{const tr=e.target.closest('tr'); if(tr) show(tr.dataset.uv,tr.dataset.uid,tr);};
+
+async function show(uv,uid,tr){
+  if(curRow)curRow.classList.remove('selected'); tr.classList.add('selected'); curRow=tr;
+  const d=await (await fetch(`/email/${uv}/${uid}`)).json();
+
+  /* ステータスフォーム */
+  const statusSel=['未対応','見積メール送信済','依頼あり','荷物受け取り','荷物返送済み']
+    .map(s=>`<option${s===d.status?' selected':''}>${s}</option>`).join('');
+
+  /* 既存メモ（オブジェクト） */
+  const notes=d.notes||{}, noteIds=Object.keys(notes).map(n=>+n);
+  let maxPage=noteIds.length?Math.max(...noteIds):1;
+
+  /* メモ HTML 生成 */
+  const noteHtml=p=>`<div class="note-block" data-p="${p}">
+      <h4>P${p}</h4>
+      <textarea>${esc(notes[p]??'')}</textarea>
+      <button class="saveBtn">保存</button>
+    </div>`;
+
+  detail.innerHTML=`
+    <h2>${esc(d.subject)}</h2>
+    <div style="margin-bottom:6px">
+      <b>UID:</b>${d.uid} / <b>顧客名:</b>${esc(d.customer_name)}
+      <button id="archBtn">${d.archived?'戻す':'アーカイブ'}</button>
+    </div>
+
+    <form id="stf" style="margin:6px 0">
+      <select name="status">${statusSel}</select>
+      <button>更新</button>
+    </form>
+
+    <div>${fmtBody(d.body)}</div>
+
+    <h3>フリーメモ <button id="addNote">＋メモ追加</button></h3>
+    <div id="notes">
+      ${noteHtml(1)}
+      ${noteIds.filter(n=>n>1).sort((a,b)=>a-b).map(noteHtml).join('')}
+    </div>
+
+    <h3>写真</h3>
+    <div class="photos">${d.photos.map(u=>`<a href="${u}" target="_blank"><img src="${u}"></a>`).join('')}</div>
+    <form id="pf" enctype="multipart/form-data" style="margin-top:6px">
+      <input type="file" name="photo" accept="image/*">
+      <button>Upload</button>
+    </form>`;
+
+/* ステータス更新 */
+document.getElementById('stf').onsubmit = e =>{
+  e.preventDefault();
+  const fd   = new FormData(e.target);
+  const newSt= fd.get('status');
+
+
+   fetch(`/emails/${uv}/${uid}/update_status`,{method:'POST',body:fd})
+     .then(res=>{
+       if(!res.ok){ alert('保存失敗'); return; }   // ← 失敗なら警告
+       tr.className = (tr.className.replace(/st-\w+/,'')+' '+statusClass(newSt)).trim();
+       return show(uv,uid,tr);                     // ← ここで最新値を再取得
+     });
+};
+
+
+  const statusClass=s=>s==='未対応'?'st-new':s==='見積メール送信済'?'st-sent':s==='依頼あり'?'st-req':s==='荷物受け取り'?'st-in':'st-out';
+
+  /* アーカイブ切替 */
+  document.getElementById('archBtn').onclick=async ()=>{
+    const j=await (await fetch(`/emails/${uv}/${uid}/toggle_archive`,{method:'POST'})).json();
+    tr.dataset.arch=j.archived?'1':'0'; tr.classList.toggle('arch',j.archived);
+    applyFilter(); document.getElementById('archBtn').textContent=j.archived?'戻す':'アーカイブ';
+  };
+
+  /* メモ保存 */
+  detail.querySelectorAll('.note-block .saveBtn').forEach(btn=>{
+    btn.onclick=()=>saveNote(btn.closest('.note-block').dataset.p);
+  });
+  function saveNote(p){
+    const v=detail.querySelector(`.note-block[data-p="${p}"] textarea`).value;
+    const fd=new FormData(); fd.append('page',p); fd.append('content',v);
+    fetch(`/emails/${uv}/${uid}/save_note`,{method:'POST',body:fd});
+  }
+
+  /* メモ追加 */
+  document.getElementById('addNote').onclick=()=>{
+    maxPage++; const notesDiv=document.getElementById('notes');
+    notesDiv.insertAdjacentHTML('beforeend',noteHtml(maxPage));
+    notesDiv.querySelector(`.note-block[data-p="${maxPage}"] .saveBtn`)
+      .onclick=()=>saveNote(maxPage);
+  };
+
+  /* 写真アップロード */
+  document.getElementById('pf').onsubmit=e=>{
+    e.preventDefault();
+    fetch(`/emails/${uv}/${uid}/upload_photo`,{method:'POST',body:new FormData(e.target)})
+      .then(()=>show(uv,uid,tr));   // 再描画
+  };
+
+  /* モーダル */
+  detail.querySelectorAll('.photos img').forEach(img=>{
+    img.onclick=ev=>{ev.preventDefault();
+      document.getElementById('img-view').src=img.parentNode.href;
+      document.getElementById('img-dl').href=img.parentNode.href;
+      modal.style.display='flex';};
+  });
+}
+/* モーダル閉じ */
+modal.onclick=e=>{if(e.target===modal) modal.style.display='none';};
+});
+</script>
+</body>
+</html>
