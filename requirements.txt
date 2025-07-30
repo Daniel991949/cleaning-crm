@@ -3,3 +3,6 @@ SQLAlchemy==2.0.23
 APScheduler==3.10.4
 requests==2.31.0
 Werkzeug==2.3.7
+beautifulsoup4==4.12.2
+lxml==4.9.3
+email-validator==2.0.0
