@@ -1,161 +1,232 @@
-import os
+# -*- coding: utf-8 -*-
+"""
+Flask UI + API  – 手動登録＋写真＋ステータス更新（Detached 回避）
+"""
+import os, logging, time
+from datetime import datetime as dt, timezone
 from pathlib import Path
-from typing import List
 
 from flask import (
-    Flask, request, jsonify, send_from_directory,
-    redirect, url_for, render_template
+    Flask, render_template, request, url_for, send_from_directory,
+    jsonify, abort, Response, redirect
 )
-
-from sqlalchemy import create_engine, inspect, text, Column, Boolean
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import (
+    create_engine, Column, Integer, BigInteger, String,
+    DateTime, Text, Boolean, inspect, text
+)
 from sqlalchemy.orm import sessionmaker
+from werkzeug.utils import secure_filename
+import requests
 
-# --- 元コード準拠：email_sync_app からモデル/同期関数を読み込む ---
-from email_sync_app import Base, EmailModel
-try:
-    # 旧名
-    from email_sync_app import sync_emails as _sync_func
-except Exception:
-    _sync_func = None
-try:
-    # 現行名
-    from email_sync_app import fetch_and_save as _fetch_and_save
-except Exception:
-    _fetch_and_save = None
+# ── メール同期ユーティリティ ─────────────────────────
+import email_sync_app
+from email_sync_app import Base, EmailModel, fetch_past_month_and_save, fetch_and_save
 
+# ── Note / Photo テーブル ────────────────────────────
+class NoteModel(Base):
+    __tablename__ = 'notes'
+    id          = Column(Integer, primary_key=True)
+    uidvalidity = Column(BigInteger, nullable=False)
+    uid         = Column(BigInteger, nullable=False)
+    page        = Column(Integer,  nullable=False)
+    content     = Column(Text,     default='')
+    uploaded_at = Column(DateTime, default=lambda: dt.now(timezone.utc))
 
-# =========================
-# 基本設定（データ保持のための変更のみ）
-# =========================
-DB_URL = os.getenv("DATABASE_URL", "sqlite:////data/emails.db")   # ← /data に永続化
-SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-secret")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")             # ← /data に永続化
+class PhotoModel(Base):
+    __tablename__ = 'photos'
+    id          = Column(Integer, primary_key=True)
+    uidvalidity = Column(BigInteger, nullable=False)
+    uid         = Column(BigInteger, nullable=False)
+    filename    = Column(String(255), nullable=False)
+    uploaded_at = Column(DateTime, default=lambda: dt.now(timezone.utc))
 
-UPLOAD_PATH = Path(UPLOAD_DIR)
-UPLOAD_PATH.mkdir(parents=True, exist_ok=True)
+# ── EmailModel に archived 列（モデル側にプロパティが無ければ付与） ──────
+if not hasattr(EmailModel, 'archived'):
+    EmailModel.archived = Column(Boolean, default=False)
 
-# =========================
-# DB 初期化
-# =========================
-engine = create_engine(DB_URL, echo=False, future=True)
-Session = sessionmaker(bind=engine, expire_on_commit=False)
+# ── Flask / DB（★永続化のための変更だけ） ─────────────────────────
+DB_URL  = os.getenv('DATABASE_URL', 'sqlite:////data/emails.db')  # ← 変更: /data に保存
+SECRET  = os.getenv('FLASK_SECRET_KEY', 'dev')
 
-# テーブルが無ければ作成
-Base.metadata.create_all(engine)
+UPLOAD_DIR = os.getenv('UPLOAD_DIR', '/data/uploads')              # ← 変更: /data に保存
+UPLOAD  = Path(UPLOAD_DIR); UPLOAD.mkdir(parents=True, exist_ok=True)
 
-# 「archived」列の後方互換（今使っている DB に対してだけ実行）
-try:
-    # モデルに属性が無ければ保険で生やす（UI互換維持）
-    if not hasattr(EmailModel, "archived"):
-        setattr(EmailModel, "archived", Column(Boolean, default=False))
-
-    insp = inspect(engine)
-    cols = [c["name"] for c in insp.get_columns("emails")]
-    if "archived" not in cols:
-        with engine.begin() as c:
-            # 元の実装互換：INTEGER 0/1 として追加（SQLite/PG双方OK）
-            c.execute(text("ALTER TABLE emails ADD COLUMN archived INTEGER DEFAULT 0"))
-except Exception:
-    # 既にある等は無視して続行
-    pass
-
-
-# =========================
-# Flask 本体
-# =========================
-# emails.html を app.py と同じ階層に置く前提で template_folder を明示
+# テンプレは templates/ フォルダ（あなたの構成に合わせる）
 TEMPLATE_DIR = str(Path(__file__).parent / "templates")
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 app.config.update(
-    SECRET_KEY=SECRET_KEY,
-    UPLOAD_FOLDER=str(UPLOAD_PATH),
-    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+    SECRET_KEY=SECRET,
+    UPLOAD_FOLDER=str(UPLOAD),
+    MAX_CONTENT_LENGTH=16*1024*1024
 )
 
+# expire_on_commit=False で Detached を防止
+engine  = create_engine(DB_URL, echo=False, future=True)
+Session = sessionmaker(bind=engine, expire_on_commit=False)
 
-# -------------------------
-# ルーティング
-# -------------------------
-@app.get("/")
+# モデル（Email/Note/Photo）をまとめて作成
+Base.metadata.create_all(engine)
+
+# ★★★ 「archived」列の後方互換：今使っているDBに対してのみ実行（固定パスを撤廃） ★★★
+try:
+    insp = inspect(engine)
+    cols = [c['name'] for c in insp.get_columns('emails')]
+    if 'archived' not in cols:
+        with engine.begin() as c:
+            # 元実装互換: INTEGER(=BOOLEAN) 0/1 で追加
+            c.execute(text("ALTER TABLE emails ADD COLUMN archived INTEGER DEFAULT 0"))
+except Exception:
+    # 既に存在／権限なし等、致命でなければ続行
+    pass
+
+# ── APScheduler（旧仕様のまま） ─────────────────────────────────
+def sync_last_month():
+    app.logger.info('▶ Initial 30-day fetch')
+    fetch_past_month_and_save()
+
+def sync_latest(limit=50):
+    app.logger.info('▶ Periodic fetch')
+    fetch_and_save(limit=limit)
+
+sched = BackgroundScheduler(timezone='Asia/Tokyo')
+sched.add_job(sync_last_month, id='initial_once', next_run_time=dt.now(timezone.utc))
+sched.add_job(sync_latest, 'interval', minutes=15, id='loop', kwargs={'limit':50})
+sched.start(); app.logger.info('Scheduler started')
+
+# ── ルーティング（旧仕様そのまま） ─────────────────────────────────
+@app.route('/')
 def index():
-    """一覧画面（元の emails.html をそのまま使う）"""
-    session = Session()
-    try:
-        rows: List[EmailModel] = session.query(EmailModel).all()
-        return render_template("emails.html", emails=rows)
-    finally:
-        session.close()
+    with Session() as s:
+        emails = s.query(EmailModel).order_by(EmailModel.date.desc()).all()
+    return render_template('emails.html', emails=emails)
 
+# ---------- 手動登録（画像複数 OK） ----------
+@app.route('/manual_add', methods=['POST'])
+def manual_add():
+    name = request.form.get('name','').strip()
+    memo = request.form.get('memo','').strip()
+    if not name:
+        return jsonify({'ok':False,'error':'名前は必須'}), 400
 
-@app.get("/emails")
-def list_emails_api():
-    """JSON API（元の形を維持）"""
-    session = Session()
-    try:
-        rows: List[EmailModel] = session.query(EmailModel).all()
-        out = []
-        for e in rows:
-            out.append({
-                "id": getattr(e, "id", None),
-                "uidvalidity": getattr(e, "uidvalidity", None),
-                "uid": getattr(e, "uid", None),
-                "message_id": getattr(e, "message_id", None),
-                "subject": getattr(e, "subject", None),
-                "customer_name": getattr(e, "customer_name", None),
-                "from": getattr(e, "from_addr", None),
-                "to": getattr(e, "to_addr", None),
-                "date": str(getattr(e, "date", None)) if getattr(e, "date", None) else None,
-                "sent_at": str(getattr(e, "sent_at", None)) if getattr(e, "sent_at", None) else None,
-                "status": getattr(e, "status", None),
-                "archived": getattr(e, "archived", False),
-                "body": getattr(e, "body", None),
-            })
-        return jsonify(out)
-    finally:
-        session.close()
+    uid  = int(time.time()*1000)
+    with Session() as s:
+        rec = EmailModel(
+            uidvalidity=0, uid=uid, message_id=f'manual-{uid}',
+            subject='手動登録', customer_name=name, body=memo,
+            date=dt.now(timezone.utc), status='手動入力', archived=False
+        )
+        s.add(rec); s.commit()
 
+        for i, f in enumerate(request.files.getlist('photos')):
+            if not f or not f.filename: continue
+            ext = Path(f.filename).suffix.lower()
+            if ext not in {'.jpg','.jpeg','.png','.gif','.webp'}: continue
+            fname = secure_filename(f"0_{uid}_{int(time.time())}_{i}{ext}")
+            f.save(UPLOAD/fname)
+            s.add(PhotoModel(uidvalidity=0, uid=uid, filename=fname))
+        s.commit()
+    return jsonify({'ok':True})
 
-@app.get("/uploads/<path:filename>")
-def uploads(filename: str):
-    """アップロード配信（元のまま）"""
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=False)
-
-
-@app.post("/sync_now")
+# ---------- 手動同期 ----------
+@app.route('/sync_now', methods=['POST'])
 def sync_now():
-    """同期エンドポイント（元の関数名に合わせて呼び分け）"""
-    if _sync_func is not None:
-        try:
-            _sync_func(50)              # 位置引数
-        except TypeError:
-            _sync_func(max_fetch=50)    # 名前付き引数
-    elif _fetch_and_save is not None:
-        try:
-            _fetch_and_save(50)
-        except TypeError:
-            _fetch_and_save(limit=50)
-    return redirect(url_for("index"))
-
-
-@app.post("/archive/<int:email_id>")
-def toggle_archive(email_id: int):
-    """アーカイブ切替（元UI互換）"""
-    session = Session()
     try:
-        if not hasattr(EmailModel, "id"):
-            # id カラムが無いスキーマの場合は何もしないで戻る
-            return redirect(url_for("index"))
-        e = session.query(EmailModel).filter(EmailModel.id == email_id).first()
-        if e is not None and hasattr(e, "archived"):
-            e.archived = not bool(getattr(e, "archived", False))
-            session.commit()
-        return redirect(url_for("index"))
-    finally:
-        session.close()
+        sync_latest(limit=10)
+        # 旧UIは戻り先が画面のこともあるので JSON or リダイレクトどちらでもOKに
+        if request.headers.get("Accept","").startswith("application/json"):
+            return jsonify({'ok': True})
+        return redirect(url_for('index'))
+    except Exception as e:
+        app.logger.exception('sync error')
+        return jsonify({'ok':False,'error':str(e)}),500
 
+# ---------- 詳細 ----------
+@app.route('/email/<int:uv>/<int:uid>')
+def email_detail(uv, uid):
+    with Session() as s:
+        m = s.query(EmailModel).filter_by(uidvalidity=uv, uid=uid).first()
+        if not m: abort(404)
+        notes  = s.query(NoteModel ).filter_by(uidvalidity=uv, uid=uid).all()
+        photos = s.query(PhotoModel).filter_by(uidvalidity=uv, uid=uid).all()
+        return jsonify({
+            'uidvalidity':m.uidvalidity,'uid':m.uid,'subject':m.subject or '',
+            'customer_name':m.customer_name or '',
+            'from_addr':m.from_addr or '',
+            'date':m.date.isoformat() if m.date else '',
+            'body':m.body or '',
+            'status':m.status or '未対応',
+            'archived':bool(m.archived),
+            'notes':{n.page:n.content for n in notes},
+            'photos':[url_for('uploaded_file',filename=p.filename) for p in photos]
+        })
 
-# -------------------------
-# メイン
-# -------------------------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+# ---------- ステータス更新 ----------
+@app.route('/emails/<int:uv>/<int:uid>/update_status', methods=['POST'])
+def update_status(uv, uid):
+    new_st = request.form.get('status','').strip()
+    with Session() as s:
+        m = s.query(EmailModel).filter_by(uidvalidity=uv, uid=uid).first()
+        if not m: abort(404)
+        if new_st: m.status = new_st
+        s.commit()
+    return '', 204
+
+# ---------- アーカイブ ----------
+@app.route('/emails/<int:uv>/<int:uid>/toggle_archive', methods=['POST'])
+def toggle_archive(uv, uid):
+    with Session() as s:
+        m = s.query(EmailModel).filter_by(uidvalidity=uv, uid=uid).first()
+        if not m: abort(404)
+        m.archived = not bool(m.archived)
+        s.commit()
+        return jsonify({'archived':bool(m.archived)})
+
+# ---------- メモ保存 ----------
+@app.route('/emails/<int:uv>/<int:uid>/save_note', methods=['POST'])
+def save_note(uv, uid):
+    page=int(request.form.get('page',1)); content=request.form.get('content','')
+    with Session() as s:
+        note = s.query(NoteModel).filter_by(uidvalidity=uv,uid=uid,page=page).first()
+        if not note: note = NoteModel(uidvalidity=uv,uid=uid,page=page)
+        note.content = content; s.add(note); s.commit()
+    return '',204
+
+# ---------- 写真追加 ----------
+@app.route('/emails/<int:uv>/<int:uid>/upload_photo', methods=['POST'])
+def upload_photo(uv, uid):
+    if 'photo' not in request.files or not request.files['photo'].filename:
+        abort(400,'no file')
+    f=request.files['photo']; ext=Path(f.filename).suffix.lower()
+    if ext not in {'.jpg','.jpeg','.png','.gif','.webp'}:
+        abort(400,'ext')
+    fname=secure_filename(f"{uv}_{uid}_{int(time.time())}{ext}")
+    f.save(UPLOAD/fname)
+    with Session() as s:
+        s.add(PhotoModel(uidvalidity=uv,uid=uid,filename=fname)); s.commit()
+    return '',204
+
+# ---------- 静的 ----------
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD, filename)
+
+@app.route('/proxy')
+def proxy():
+    url=request.args.get('url','')
+    if not url.startswith(('http://','https://')): abort(400)
+    try:
+        r=requests.get(url,timeout=10)
+    except requests.exceptions.RequestException:
+        abort(502)
+    return Response(
+        r.content, status=r.status_code,
+        content_type=r.headers.get('Content-Type','application/octet-stream'),
+        headers={'Cache-Control':'public, max-age=86400'}
+    )
+
+# ── メイン ────────────────────────────────────────────
+if __name__=='__main__':
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
