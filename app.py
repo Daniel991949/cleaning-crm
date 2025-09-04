@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from typing import List
-
+from pathlib import Path
 from flask import (
     Flask, request, jsonify, send_from_directory,
     redirect, url_for, render_template
@@ -32,7 +32,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")             # ← 変更�
 
 UPLOAD_PATH = Path(UPLOAD_DIR)
 UPLOAD_PATH.mkdir(parents=True, exist_ok=True)
-
+TEMPLATE_DIR = str(Path(__file__).parent)
 # =========================
 # DB 初期化
 # =========================
@@ -63,7 +63,7 @@ except Exception:
 # Flask 本体
 # =========================
 # emails.html をプロジェクト直下に置いている想定なので template_folder='.' にする
-app = Flask(__name__, template_folder=".")
+app = Flask(__name__, template_folder=TEMPLATE_DIR)
 app.config.update(
     SECRET_KEY=SECRET_KEY,
     UPLOAD_FOLDER=str(UPLOAD_PATH),
