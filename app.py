@@ -64,7 +64,7 @@ except Exception:
 # Flask 本体
 # =========================
 # emails.html を app.py と同じ階層に置く前提で template_folder を明示
-TEMPLATE_DIR = str(Path(__file__).parent)
+TEMPLATE_DIR = str(Path(__file__).parent / "templates")
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 app.config.update(
     SECRET_KEY=SECRET_KEY,
