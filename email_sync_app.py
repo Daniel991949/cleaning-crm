@@ -29,7 +29,7 @@ IMAP_PORT     = int(os.getenv('IMAP_PORT', '993'))
 IMAP_USER     = os.getenv('IMAP_USER')
 IMAP_PASSWORD = os.getenv('IMAP_PASSWORD')
 MAILBOX       = os.getenv('IMAP_MAILBOX', 'INBOX')
-DB_URL        = os.getenv('DATABASE_URL', 'sqlite:///emails.db')
+DB_URL = os.getenv('DATABASE_URL', 'sqlite:////data/emails.db')
 if not IMAP_USER or not IMAP_PASSWORD:
     print('[ERROR] 環境変数に IMAP_USER / IMAP_PASSWORD がありません', file=sys.stderr)
     # sys.exit(1)  # デプロイ時はエラー終了を回避
